@@ -8,6 +8,13 @@ import torch.nn.functional as F
 from instanseg.utils.tiling import _chops, _stitch, _stitch_mean, _tiles_from_chops
 
 
+def _chop_top_left(chop):
+    slices = [part for part in chop if isinstance(part, slice)]
+    if len(slices) >= 2:
+        return int(slices[-2].start or 0), int(slices[-1].start or 0)
+    return int(chop[-2][0]), int(chop[-1][0])
+
+
 def segment_large_tissue(
     image: torch.Tensor,
     segmentation_model: nn.Module,
@@ -20,11 +27,12 @@ def segment_large_tissue(
     max_seeds: int = 10000,
     window_size: int = 64,
     detection_size: int = 20,
+    return_patch_embeddings: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Predict a full-tissue instance mask and semantic logits for tissues too large to
     segment in one shot.
 
-    Args: 
+    Args:
         image: Input image of shape (C, H, W).
         segmentation_model: A segmentation model.
         channel_ids: A tensor of shape (C,) containing the channel IDs for the input image.
@@ -48,12 +56,20 @@ def segment_large_tissue(
 
     instance_label_tiles = []
     semantic_logit_tiles = []
+    patch_embedding_tiles = []
+    patch_coords_yx = []
 
     with torch.no_grad():
         for i in tqdm(range(0, len(tiles), bs)):
             batch = torch.stack(tiles[i : i + bs]).to(device)
             channels = [channel_ids.to(device)] * len(batch)
-            logits = segmentation_model([img for img in batch], channels).detach()
+            if return_patch_embeddings:
+                logits, patch_embeddings = segmentation_model([img for img in batch], channels, return_patch_embeddings=True)
+                patch_embedding_tiles.extend([p.detach().cpu() for p in patch_embeddings])
+                patch_coords_yx.extend([_chop_top_left(chop) for chop in chop_idx[i : i + len(batch)]])
+            else:
+                logits = segmentation_model([img for img in batch], channels)
+            logits = logits.detach()
             if logits.shape[-2:] != tile_hw:
                 logits = F.interpolate(logits, size=tile_hw, mode="bilinear", align_corners=False)
 
@@ -68,7 +84,7 @@ def segment_large_tissue(
                 semantic_logit_tiles.append(tile_logits[n_instance_channels:].cpu())
 
     pred_instance, _ = _stitch(
-        instance_label_tiles, shape=tile_hw, chop_list=chop_idx, offset=ovlp, final_shape=(1, h, w)
+        instance_label_tiles, shape=tile_hw, chop_list=chop_idx, offset=ovlp, final_shape=(1, h, w),
     )
     semantic_logits = _stitch_mean(
         semantic_logit_tiles,
@@ -76,4 +92,6 @@ def segment_large_tissue(
         chop_list=chop_idx,
         final_shape=(semantic_logit_tiles[0].shape[0], h, w),
     )
+    if return_patch_embeddings:
+        return pred_instance[0], semantic_logits, torch.stack(patch_embedding_tiles, dim=0), torch.tensor(patch_coords_yx, dtype=torch.long)
     return pred_instance[0], semantic_logits

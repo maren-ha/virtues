@@ -37,7 +37,7 @@ class ESMWrapper:
                     }.get(self.model_name)
 
         with torch.no_grad():
-            results = self.model(batch_tokens, repr_layers=[layer_nr], return_contacts=True)
+            results = self.model(batch_tokens, repr_layers=[layer_nr], return_contacts=False)
 
             token_representations = results["representations"][layer_nr]
 

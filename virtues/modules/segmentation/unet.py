@@ -9,7 +9,7 @@ from einops import rearrange
 from instanseg.utils.loss.instanseg_loss import InstanSeg as InstanceProcessor
 from instanseg.utils.tiling import _chops, _tiles_from_chops, _stitch_mean
 
-from virtues.modules.segmentation.utils import segment_large_tissue
+from virtues.modules.segmentation.utils import _chop_top_left, segment_large_tissue
 
 
 class Conv2DBlock(nn.Module):
@@ -36,6 +36,7 @@ class Deconv2DBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.block(x)
+
 
 class VirtuesTokenUNetDecoder(nn.Module):
     def __init__(self, embed_dim: int, out_channels: int):
@@ -153,33 +154,35 @@ class VirtuesSegmentationHead(nn.Module):
             window_size=64,
         )
         self.instance_processor.initialize_pixel_classifier(self, MLP_width=5)
-        
 
     def _encode(self, mx_images, channels):
         amp_enabled = mx_images[0].device.type == "cuda"
         with torch.no_grad():
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled):
                 virtues_output = self.virtues_model.encoder.forward_list(mx_images, channels, return_intermediate_layers=self.intermediate_layers)
-        
+
         ps = virtues_output.patch_summary_tokens
         intermediate_layers = torch.stack(list(virtues_output.intermediate_representations.values()))
 
         ps = torch.stack(ps, dim=0)
         z0 = rearrange(ps, "b h w d -> b (h w) d")
-        return z0, intermediate_layers
+        return z0, intermediate_layers, ps
 
-    def forward(self, mx_images, channels):
+    def forward(self, mx_images, channels, return_patch_embeddings=False):
 
-        z0, intermediate_layers = self._encode(mx_images, channels)
+        z0, intermediate_layers, patch_embeddings = self._encode(mx_images, channels)
         out = self.decoder(z0, intermediate_layers)
         if self.num_celltypes is not None:
             phenotypes = self.decoder_phenotypes(z0, intermediate_layers)
             out = torch.cat([out, phenotypes], dim=1)
 
+        if return_patch_embeddings:
+            return out, patch_embeddings
+
         return out
 
     @torch.no_grad()
-    def segment_tile(self, multiplex, channel_ids):
+    def segment_tile(self, multiplex, channel_ids, return_patch_embeddings=False):
         """
         Computes cell segmentation and instance segmentation logits for the given multiplexed image and channel ids.
         Args:
@@ -189,21 +192,30 @@ class VirtuesSegmentationHead(nn.Module):
             pred_instance (torch.Tensor): The predicted instance segmentation mask. The tensor will be of shape (H,W) with integer values representing different instances.
             semantic_logits (torch.Tensor): The predicted semantic segmentation logits. The tensor will be of shape (num_classes,H,W).
         """
-        logits = self.forward([multiplex], [channel_ids])[0]
+        if return_patch_embeddings:
+            logits, patch_embeddings = self.forward([multiplex], [channel_ids], return_patch_embeddings=True)
+            logits = logits[0]
+            patch_embeddings = patch_embeddings[0]
+        else:
+            logits = self.forward([multiplex], [channel_ids])[0]
         inst_logits = logits[: self.dim_out]
         pred_instance = self.instance_processor.postprocessing(inst_logits, window_size=64, cleanup_fragments=True)[0]
-        semantic_logits = logits[self.dim_out:, :, :]
+        semantic_logits = logits[self.dim_out :, :, :]
+        if return_patch_embeddings:
+            return pred_instance, semantic_logits, patch_embeddings
         return pred_instance, semantic_logits
-    
+
     @torch.no_grad()
-    def segment_tissue(self,
-                    multiplex_tissue: torch.Tensor,
-                    channel_ids: torch.Tensor,
-                    tile_size: int,
-                    overlap: int,
-                    batch_size: int,
-                    large_tissue_threshold: int = 1500,
-                    ):
+    def segment_tissue(
+        self,
+        multiplex_tissue: torch.Tensor,
+        channel_ids: torch.Tensor,
+        tile_size: int,
+        overlap: int,
+        batch_size: int,
+        large_tissue_threshold: int = 1500,
+        return_patch_embeddings: bool = False,
+    ):
         """
         Computes cell segmentation and instance segmentation logits for a large multiplexed tissue image by processing it in tiles.
 
@@ -218,7 +230,7 @@ class VirtuesSegmentationHead(nn.Module):
             overlap (int): The overlap (in pixels) between neighbouring tiles.
             batch_size (int): The number of tiles processed per batch.
             large_tissue_threshold (int, optional): If the tissue's longer side exceeds this threshold, delegates to `segment_large_tissue`. Defaults to 1500.
-        
+
         Returns:
             pred_instance (torch.Tensor): The predicted instance segmentation mask for the entire tissue. The tensor will be of shape (H,W) with integer values representing different instances.
             semantic_logits (torch.Tensor): The predicted semantic segmentation logits for the entire tissue. The tensor will be of shape (num_classes,H,W).
@@ -226,7 +238,7 @@ class VirtuesSegmentationHead(nn.Module):
         h, w = int(multiplex_tissue.shape[-2]), int(multiplex_tissue.shape[-1])
 
         if max(h, w) > large_tissue_threshold:
-            pred_instance, semantic_logits = segment_large_tissue(
+            output = segment_large_tissue(
                 multiplex_tissue,
                 self,
                 channel_ids,
@@ -234,7 +246,12 @@ class VirtuesSegmentationHead(nn.Module):
                 ovlp=overlap,
                 bs=batch_size,
                 device=str(multiplex_tissue.device),
+                return_patch_embeddings=return_patch_embeddings,
             )
+            if return_patch_embeddings:
+                pred_instance, semantic_logits, patch_embeddings, patch_coords_yx = output
+                return pred_instance.cpu(), semantic_logits.cpu(), patch_embeddings.cpu(), patch_coords_yx.cpu()
+            pred_instance, semantic_logits = output
             return pred_instance.cpu(), semantic_logits.cpu()
 
         tile_hw = (min(tile_size, h), min(tile_size, w))
@@ -242,11 +259,18 @@ class VirtuesSegmentationHead(nn.Module):
         tiles = _tiles_from_chops(multiplex_tissue, shape=tile_hw, tuple_index=chop_idx)
 
         logits_tiles = []
+        patch_embedding_tiles = []
+        patch_coords_yx = []
 
         for i in tqdm(range(0, len(tiles), batch_size)):
             image_batch = torch.stack(tiles[i : i + batch_size])
             # with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
-            pred = self.forward(image_batch, [channel_ids] * len(image_batch))
+            if return_patch_embeddings:
+                pred, patch_embeddings = self.forward(image_batch, [channel_ids] * len(image_batch), return_patch_embeddings=True)
+                patch_embedding_tiles.extend([p.detach().cpu() for p in patch_embeddings])
+                patch_coords_yx.extend([_chop_top_left(chop) for chop in chop_idx[i : i + len(image_batch)]])
+            else:
+                pred = self.forward(image_batch, [channel_ids] * len(image_batch))
 
             pred = pred.detach()
             if pred.shape[-2:] != tile_hw:
@@ -261,6 +285,10 @@ class VirtuesSegmentationHead(nn.Module):
         )
 
         inst_logits = stitched_logits[: self.dim_out]
-        pred_instance = self.instance_processor.postprocessing(inst_logits, window_size=64, cleanup_fragments=True, max_seeds=20000)[0]
-        semantic_logits = stitched_logits[self.dim_out:, :, :]
+        pred_instance = self.instance_processor.postprocessing(
+            inst_logits, window_size=64, cleanup_fragments=True, max_seeds=20000
+        )[0]
+        semantic_logits = stitched_logits[self.dim_out :, :, :]
+        if return_patch_embeddings:
+            return pred_instance.cpu(), semantic_logits.cpu(), torch.stack(patch_embedding_tiles, dim=0), torch.tensor(patch_coords_yx, dtype=torch.long)
         return pred_instance.cpu(), semantic_logits.cpu()
