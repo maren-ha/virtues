@@ -6,14 +6,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from instanseg.utils.tiling import _chops, _stitch, _stitch_mean, _tiles_from_chops
+from itertools import product
+
+def _chop_start(x):
+    if isinstance(x, slice):
+        return int(x.start or 0)
+    try:
+        return int(x[0])
+    except (TypeError, IndexError):
+        return int(x)
 
 
-def _chop_top_left(chop):
-    slices = [part for part in chop if isinstance(part, slice)]
-    if len(slices) >= 2:
-        return int(slices[-2].start or 0), int(slices[-1].start or 0)
-    return int(chop[-2][0]), int(chop[-1][0])
+def _chop_starts(chops):
+    return [_chop_start(chop) for chop in chops]
 
+
+def _chop_top_left_coords(chop_idx):
+    y_starts = _chop_starts(chop_idx[-2])
+    x_starts = _chop_starts(chop_idx[-1])
+    return [(y, x) for y, x in product(y_starts, x_starts)]
 
 def segment_large_tissue(
     image: torch.Tensor,
@@ -50,6 +61,7 @@ def segment_large_tissue(
     tile_hw = (min(tile, h), min(tile, w))
     chop_idx = _chops(image.shape, shape=tile_hw, overlap=2 * (ovlp + detection_size))
     tiles = _tiles_from_chops(image, shape=tile_hw, tuple_index=chop_idx)
+    patch_coords_all = _chop_top_left_coords(chop_idx)
 
     instance_processor = segmentation_model.instance_processor
     n_instance_channels = int(segmentation_model.dim_out)
@@ -66,7 +78,7 @@ def segment_large_tissue(
             if return_patch_embeddings:
                 logits, patch_embeddings = segmentation_model([img for img in batch], channels, return_patch_embeddings=True)
                 patch_embedding_tiles.extend([p.detach().cpu() for p in patch_embeddings])
-                patch_coords_yx.extend([_chop_top_left(chop) for chop in chop_idx[i : i + len(batch)]])
+                patch_coords_yx.extend(patch_coords_all[i : i + len(batch)])
             else:
                 logits = segmentation_model([img for img in batch], channels)
             logits = logits.detach()

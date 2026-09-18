@@ -9,7 +9,7 @@ from einops import rearrange
 from instanseg.utils.loss.instanseg_loss import InstanSeg as InstanceProcessor
 from instanseg.utils.tiling import _chops, _tiles_from_chops, _stitch_mean
 
-from virtues.modules.segmentation.utils import _chop_top_left, segment_large_tissue
+from virtues.modules.segmentation.utils import _chop_top_left_coords, segment_large_tissue
 
 
 class Conv2DBlock(nn.Module):
@@ -257,6 +257,7 @@ class VirtuesSegmentationHead(nn.Module):
         tile_hw = (min(tile_size, h), min(tile_size, w))
         chop_idx = _chops(multiplex_tissue.shape, shape=tile_hw, overlap=2 * overlap)
         tiles = _tiles_from_chops(multiplex_tissue, shape=tile_hw, tuple_index=chop_idx)
+        patch_coords_all = _chop_top_left_coords(chop_idx)
 
         logits_tiles = []
         patch_embedding_tiles = []
@@ -268,7 +269,7 @@ class VirtuesSegmentationHead(nn.Module):
             if return_patch_embeddings:
                 pred, patch_embeddings = self.forward(image_batch, [channel_ids] * len(image_batch), return_patch_embeddings=True)
                 patch_embedding_tiles.extend([p.detach().cpu() for p in patch_embeddings])
-                patch_coords_yx.extend([_chop_top_left(chop) for chop in chop_idx[i : i + len(image_batch)]])
+                patch_coords_yx.extend(patch_coords_all[i : i + len(image_batch)])
             else:
                 pred = self.forward(image_batch, [channel_ids] * len(image_batch))
 
